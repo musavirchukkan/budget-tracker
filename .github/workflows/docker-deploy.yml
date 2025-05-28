@@ -1,0 +1,349 @@
+name: 🐳 Docker Production Deploy
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'production'
+        type: choice
+        options:
+        - production
+        - staging
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  # Build and test
+  test:
+    runs-on: ubuntu-latest
+    name: 🧪 Test & Build
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+      
+    - name: 🐳 Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: 🔑 Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: 🏗️ Build test images
+      run: |
+        # Build backend for testing
+        docker build -f docker/backend/Dockerfile.local -t budget-backend-test ./backend
+        
+        # Build frontend for testing
+        docker build -f docker/frontend/Dockerfile.local -t budget-frontend-test ./frontend
+        
+    - name: 🧪 Run backend tests
+      run: |
+        docker run --rm \
+          -e DEBUG=True \
+          -e SECRET_KEY=test-secret-key \
+          -e DATABASE_URL=sqlite:///test.db \
+          budget-backend-test \
+          sh -c "python manage.py check && python manage.py test"
+          
+    - name: 🏗️ Build frontend
+      run: |
+        docker run --rm \
+          -e VITE_API_URL=https://api.example.com \
+          -v $(pwd)/frontend/dist:/app/dist \
+          budget-frontend-test \
+          npm run build
+
+  # Build production images
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    name: 🏗️ Build Production Images
+    outputs:
+      backend-image: ${{ steps.backend-meta.outputs.tags }}
+      frontend-image: ${{ steps.frontend-meta.outputs.tags }}
+      nginx-image: ${{ steps.nginx-meta.outputs.tags }}
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+      
+    - name: 🐳 Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: 🔑 Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.REGISTRY }}
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    
+    # Backend Image
+    - name: 📝 Extract backend metadata
+      id: backend-meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-backend
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=raw,value=latest,enable={{is_default_branch}}
+          
+    - name: 🏗️ Build and push backend image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./backend
+        file: ./docker/backend/Dockerfile.prod
+        push: true
+        tags: ${{ steps.backend-meta.outputs.tags }}
+        labels: ${{ steps.backend-meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    # Frontend Image  
+    - name: 📝 Extract frontend metadata
+      id: frontend-meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-frontend
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=raw,value=latest,enable={{is_default_branch}}
+          
+    - name: 🏗️ Build and push frontend image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./frontend
+        file: ./docker/frontend/Dockerfile.prod
+        push: true
+        tags: ${{ steps.frontend-meta.outputs.tags }}
+        labels: ${{ steps.frontend-meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          VITE_API_URL=https://${{ secrets.DOMAIN_NAME }}/api
+          
+    # Nginx Image
+    - name: 📝 Extract nginx metadata  
+      id: nginx-meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-nginx
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=raw,value=latest,enable={{is_default_branch}}
+          
+    - name: 🏗️ Build and push nginx image
+      uses: docker/build-push-action@v5
+      with:
+        context: ./docker/nginx
+        file: ./docker/nginx/Dockerfile.prod
+        push: true
+        tags: ${{ steps.nginx-meta.outputs.tags }}
+        labels: ${{ steps.nginx-meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+  # Deploy to production
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    name: 🚀 Deploy to Production
+    environment: production
+    
+    steps:
+    - name: 📥 Checkout code
+      uses: actions/checkout@v4
+      
+    - name: 🔑 Setup SSH key
+      uses: webfactory/ssh-agent@v0.8.0
+      with:
+        ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+        
+    - name: 📋 Add EC2 to known hosts
+      run: |
+        ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+        
+    - name: 🚀 Deploy to EC2
+      env:
+        EC2_HOST: ${{ secrets.EC2_HOST }}
+        EC2_USER: ${{ secrets.EC2_USER }}
+        DOMAIN_NAME: ${{ secrets.DOMAIN_NAME }}
+        DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        SECRET_KEY: ${{ secrets.SECRET_KEY }}
+        EMAIL: ${{ secrets.EMAIL }}
+        REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
+        BACKEND_IMAGE: ${{ needs.build.outputs.backend-image }}
+        FRONTEND_IMAGE: ${{ needs.build.outputs.frontend-image }}
+        NGINX_IMAGE: ${{ needs.build.outputs.nginx-image }}
+      run: |
+        ssh $EC2_USER@$EC2_HOST << 'EOF'
+          set -e
+          
+          echo "🚀 Starting Docker deployment..."
+          
+          # Navigate to application directory
+          cd /var/www/budget-tracker
+          
+          # Pull latest code
+          git fetch --all
+          git reset --hard origin/main
+          
+          # Login to GitHub Container Registry
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          
+          # Create production environment file
+          cat > .env.prod << EOL
+          SECRET_KEY=${SECRET_KEY}
+          DB_PASSWORD=${DB_PASSWORD}
+          REDIS_PASSWORD=${REDIS_PASSWORD}
+          DOMAIN_NAME=${DOMAIN_NAME}
+          EMAIL=${EMAIL}
+          
+          # Container Images
+          BACKEND_IMAGE=${BACKEND_IMAGE}
+          FRONTEND_IMAGE=${FRONTEND_IMAGE}
+          NGINX_IMAGE=${NGINX_IMAGE}
+          EOL
+          
+          # Pull latest images
+          echo "📥 Pulling latest Docker images..."
+          docker-compose -f docker-compose.prod.yml pull
+          
+          # Stop existing services
+          echo "🛑 Stopping existing services..."
+          docker-compose -f docker-compose.prod.yml down --remove-orphans
+          
+          # Start new services
+          echo "🏁 Starting new services..."
+          docker-compose -f docker-compose.prod.yml up -d --force-recreate
+          
+          # Wait for services to be ready
+          echo "⏳ Waiting for services to be ready..."
+          sleep 30
+          
+          # Run database migrations
+          echo "📊 Running database migrations..."
+          docker-compose -f docker-compose.prod.yml exec -T backend python manage.py migrate
+          
+          # Collect static files
+          echo "📁 Collecting static files..."
+          docker-compose -f docker-compose.prod.yml exec -T backend python manage.py collectstatic --noinput
+          
+          # Create superuser if needed (idempotent)
+          echo "👤 Creating/updating superuser..."
+          docker-compose -f docker-compose.prod.yml exec -T backend python manage.py shell -c "
+          from django.contrib.auth import get_user_model
+          User = get_user_model()
+          if not User.objects.filter(email='admin@${DOMAIN_NAME}').exists():
+              User.objects.create_superuser('admin@${DOMAIN_NAME}', 'admin@${DOMAIN_NAME}', '${SECRET_KEY}')
+              print('Superuser created')
+          else:
+              print('Superuser already exists')
+          "
+          
+          # Setup SSL certificate if needed
+          if [ ! -f "ssl/certbot/conf/live/${DOMAIN_NAME}/fullchain.pem" ]; then
+            echo "🔒 Setting up SSL certificate..."
+            docker-compose -f docker-compose.prod.yml --profile certbot up certbot
+          fi
+          
+          # Cleanup old images
+          echo "🧹 Cleaning up old Docker images..."
+          docker image prune -f
+          
+          echo "✅ Deployment completed successfully!"
+        EOF
+        
+    - name: 🔍 Health check
+      run: |
+        echo "🏥 Performing health checks..."
+        sleep 60  # Wait for services to fully start
+        
+        # Check API health
+        for i in {1..5}; do
+          if curl -f https://${{ secrets.DOMAIN_NAME }}/api/health/; then
+            echo "✅ API health check passed"
+            break
+          else
+            echo "⏳ Health check attempt $i failed, retrying..."
+            sleep 10
+          fi
+          
+          if [ $i -eq 5 ]; then
+            echo "❌ API health check failed after 5 attempts"
+            exit 1
+          fi
+        done
+        
+        # Check frontend
+        if curl -f https://${{ secrets.DOMAIN_NAME }}/; then
+          echo "✅ Frontend health check passed"
+        else
+          echo "❌ Frontend health check failed"
+          exit 1
+        fi
+        
+    - name: 📊 Deployment summary
+      if: always()
+      run: |
+        if [ ${{ job.status }} == 'success' ]; then
+          echo "🎉 Deployment successful!"
+          echo "🌐 Frontend: https://${{ secrets.DOMAIN_NAME }}"
+          echo "🔌 API: https://${{ secrets.DOMAIN_NAME }}/api"
+          echo "👨‍💼 Admin: https://${{ secrets.DOMAIN_NAME }}/admin"
+          echo "🏥 Health: https://${{ secrets.DOMAIN_NAME }}/api/health/"
+        else
+          echo "💥 Deployment failed!"
+          echo "Check the logs above for details."
+          exit 1
+        fi
+
+  # Post-deployment tasks
+  post-deploy:
+    needs: deploy
+    runs-on: ubuntu-latest
+    name: 📋 Post-deployment Tasks
+    if: success()
+    
+    steps:
+    - name: 🔑 Setup SSH key
+      uses: webfactory/ssh-agent@v0.8.0
+      with:
+        ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+        
+    - name: 📋 Add EC2 to known hosts
+      run: |
+        ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+        
+    - name: 💾 Backup production database
+      run: |
+        ssh ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'EOF'
+          cd /var/www/budget-tracker
+          docker-compose -f docker-compose.prod.yml exec -T db pg_dump -U budget_user budget_tracker > backups/post_deploy_$(date +%Y%m%d_%H%M%S).sql
+          echo "✅ Post-deployment backup created"
+        EOF
+        
+    - name: 📈 Update monitoring
+      run: |
+        # Optional: Send deployment notification to monitoring service
+        curl -X POST "https://api.uptimerobot.com/v2/newMonitor" \
+          -H "Content-Type: application/x-www-form-urlencoded" \
+          -d "api_key=${{ secrets.UPTIMEROBOT_API_KEY }}&format=json&type=1&url=https://${{ secrets.DOMAIN_NAME }}&friendly_name=Budget Tracker" || true

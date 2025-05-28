@@ -1,0 +1,297 @@
+version: '3.8'
+
+# 🚀 PRODUCTION DEPLOYMENT - AWS EC2 + Docker
+# Usage: docker-compose -f docker-compose.prod.yml up -d --build
+
+services:
+  # PostgreSQL Database with backups
+  db:
+    image: postgres:15-alpine
+    container_name: budget_db_prod
+    environment:
+      POSTGRES_DB: budget_tracker
+      POSTGRES_USER: budget_user
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - postgres_data_prod:/var/lib/postgresql/data
+      - ./backups:/backups
+      - ./docker/postgres/postgresql.conf:/etc/postgresql/postgresql.conf
+    ports:
+      - "127.0.0.1:5432:5432"  # Only localhost access
+    networks:
+      - budget_network_prod
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U budget_user -d budget_tracker"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Redis for caching and sessions
+  redis:
+    image: redis:7-alpine
+    container_name: budget_redis_prod
+    command: redis-server --appendonly yes --requirepass ${REDIS_PASSWORD:-defaultpass}
+    volumes:
+      - redis_data_prod:/data
+      - ./docker/redis/redis.conf:/usr/local/etc/redis/redis.conf
+    ports:
+      - "127.0.0.1:6379:6379"  # Only localhost access
+    networks:
+      - budget_network_prod
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD:-defaultpass}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # Django Backend with Gunicorn
+  backend:
+    build:
+      context: ./backend
+      dockerfile: ../docker/backend/Dockerfile.prod
+    container_name: budget_backend_prod
+    environment:
+      - DEBUG=False
+      - SECRET_KEY=${SECRET_KEY}
+      - DATABASE_URL=postgresql://budget_user:${DB_PASSWORD}@db:5432/budget_tracker
+      - REDIS_URL=redis://:${REDIS_PASSWORD:-defaultpass}@redis:6379/0
+      - ALLOWED_HOSTS=${DOMAIN_NAME},www.${DOMAIN_NAME}
+      - CORS_ALLOWED_ORIGINS=https://${DOMAIN_NAME},https://www.${DOMAIN_NAME}
+      - SECURE_SSL_REDIRECT=True
+      - SECURE_PROXY_SSL_HEADER=HTTP_X_FORWARDED_PROTO,https
+    volumes:
+      - backend_static_prod:/app/staticfiles
+      - backend_media_prod:/app/media
+      - ./logs:/app/logs
+    expose:
+      - "8000"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - budget_network_prod
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+    command: >
+      sh -c "
+        echo '🚀 Starting production backend...' &&
+        python manage.py collectstatic --noinput &&
+        python manage.py migrate &&
+        python manage.py compress --force &&
+        gunicorn budget_tracker.wsgi:application 
+          --bind 0.0.0.0:8000 
+          --workers 3 
+          --worker-class gthread 
+          --threads 2 
+          --worker-connections 1000 
+          --max-requests 1000 
+          --max-requests-jitter 100 
+          --timeout 60 
+          --keep-alive 5 
+          --access-logfile /app/logs/gunicorn-access.log 
+          --error-logfile /app/logs/gunicorn-error.log 
+          --log-level info
+      "
+
+  # React Frontend - Build and serve
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: ../docker/frontend/Dockerfile.prod
+    container_name: budget_frontend_prod
+    environment:
+      - VITE_API_URL=https://${DOMAIN_NAME}/api
+      - NODE_ENV=production
+    volumes:
+      - frontend_build_prod:/app/dist
+    networks:
+      - budget_network_prod
+    restart: "no"  # Only runs once to build
+    command: npm run build
+
+  # Nginx Reverse Proxy & Static Files
+  nginx:
+    image: nginx:alpine
+    container_name: budget_nginx_prod
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./docker/nginx/prod.conf.template:/etc/nginx/templates/default.conf.template
+      - frontend_build_prod:/var/www/html
+      - backend_static_prod:/var/www/static
+      - backend_media_prod:/var/www/media
+      - ./ssl/certbot/conf:/etc/letsencrypt
+      - ./ssl/certbot/www:/var/www/certbot
+      - ./logs/nginx:/var/log/nginx
+    environment:
+      - DOMAIN_NAME=${DOMAIN_NAME}
+      - BACKEND_HOST=backend
+      - BACKEND_PORT=8000
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - budget_network_prod
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/api/health/"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  # SSL Certificate Management
+  certbot:
+    image: certbot/certbot
+    container_name: budget_certbot_prod
+    volumes:
+      - ./ssl/certbot/conf:/etc/letsencrypt
+      - ./ssl/certbot/www:/var/www/certbot
+    environment:
+      - EMAIL=${EMAIL}
+      - DOMAIN_NAME=${DOMAIN_NAME}
+    networks:
+      - budget_network_prod
+    profiles:
+      - certbot  # Only run when needed
+    command: >
+      sh -c "
+        certbot certonly --webroot 
+          -w /var/www/certbot 
+          --email ${EMAIL} 
+          -d ${DOMAIN_NAME} 
+          -d www.${DOMAIN_NAME} 
+          --agree-tos 
+          --no-eff-email 
+          --non-interactive || exit 0
+      "
+
+  # Database Backup Service
+  backup:
+    build:
+      context: ./docker/backup
+      dockerfile: Dockerfile
+    container_name: budget_backup_prod
+    environment:
+      - DB_NAME=budget_tracker
+      - DB_USER=budget_user
+      - DB_PASSWORD=${DB_PASSWORD}
+      - DB_HOST=db
+      - BACKUP_RETENTION_DAYS=30
+      - S3_BUCKET=${S3_BACKUP_BUCKET:-}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+    volumes:
+      - ./backups:/backups
+      - postgres_data_prod:/var/lib/postgresql/data:ro
+    depends_on:
+      - db
+    networks:
+      - budget_network_prod
+    restart: unless-stopped
+    profiles:
+      - backup  # Optional service
+    command: >
+      sh -c "
+        echo '⏰ Setting up backup cron job...' &&
+        echo '0 2 * * * /backup.sh >> /var/log/backup.log 2>&1' | crontab - &&
+        crond -f -l 8
+      "
+
+  # Monitoring & Logs
+  watchtower:
+    image: containrrr/watchtower
+    container_name: budget_watchtower_prod
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=3600  # Check every hour
+      - WATCHTOWER_ROLLING_RESTART=true
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    networks:
+      - budget_network_prod
+    restart: unless-stopped
+    profiles:
+      - monitoring  # Optional service
+
+volumes:
+  postgres_data_prod:
+    name: budget_postgres_prod
+    driver: local
+  redis_data_prod:
+    name: budget_redis_prod
+    driver: local
+  backend_static_prod:
+    name: budget_static_prod
+    driver: local
+  backend_media_prod:
+    name: budget_media_prod
+    driver: local
+  frontend_build_prod:
+    name: budget_frontend_prod
+    driver: local
+
+networks:
+  budget_network_prod:
+    name: budget_network_prod
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# 🚀 PRODUCTION DEPLOYMENT COMMANDS:
+#
+# 1. INITIAL SETUP:
+#    docker-compose -f docker-compose.prod.yml up -d --build
+#    
+# 2. SSL CERTIFICATE:
+#    docker-compose -f docker-compose.prod.yml --profile certbot up certbot
+#    
+# 3. ENABLE BACKUPS:
+#    docker-compose -f docker-compose.prod.yml --profile backup up -d backup
+#    
+# 4. ENABLE MONITORING:
+#    docker-compose -f docker-compose.prod.yml --profile monitoring up -d watchtower
+#    
+# 5. VIEW LOGS:
+#    docker-compose -f docker-compose.prod.yml logs -f backend
+#    
+# 6. UPDATE DEPLOYMENT:
+#    docker-compose -f docker-compose.prod.yml pull
+#    docker-compose -f docker-compose.prod.yml up -d --force-recreate
+#    
+# 7. BACKUP DATABASE:
+#    docker-compose -f docker-compose.prod.yml exec backup /backup.sh
+#    
+# 8. SCALE BACKEND:
+#    docker-compose -f docker-compose.prod.yml up -d --scale backend=3
